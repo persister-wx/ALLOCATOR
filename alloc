@@ -1,0 +1,330 @@
+#pragma once
+#define _CRT_SECURE_NO_WARNINGS 1
+#include<memory>
+#define  NULL 0
+#include<string.h>
+#include<stdio.h>
+#include<iostream>
+using namespace std;
+
+//加入空间配置器
+/////////////////////////////////////////////////
+
+#include<stdarg.h>
+
+#define __DEBUG__
+static string GetFileName(const string& path)
+{
+	char ch = '/';
+
+#ifdef _WIN32
+	ch = '\\';
+#endif
+
+	size_t pos = path.rfind(ch);
+	if (pos == string::npos)
+		return path;
+	else
+		return path.substr(pos + 1);
+}
+
+FILE* fout = fopen("trace.log", "w");
+
+struct Realse
+{
+	~Realse()
+	{
+		cout << "flose trace.log" << endl;
+		fclose(fout);
+	}
+};
+
+Realse r;
+
+//用于调试追溯的trace log
+inline static void __trace_debug(const char* function,
+	const char* filename, int line, char* format, ...)
+{
+#ifdef __DEBUG__
+	FILE* fout = fopen("trace.log", "a+");
+	//输出调用函数的信息
+	fprintf(fout, "【%s:%d】%s", GetFileName(filename).c_str(), line, function);
+
+	//输出用户打的trace信息
+	va_list args;
+	va_start(args, format);
+	vfprintf(fout, format, args);
+	va_end(args);
+
+	fclose(fout);
+#endif
+
+}
+
+#define __TRACE_DEBUG(...)  \
+	__trace_debug(__FUNCTION__, __FILE__, __LINE__, __VA_ARGS__);
+
+/////////////////////////////////////////////
+////////////一级空间配置器//////////////////
+
+typedef void(*HANDLEFUNC)(void);
+
+template<int inst>//预留参数，是为了支持单例
+class AllocMallocTemplate
+{
+public:
+	//调一级空间配置器来申请内存
+	static void* Allocate(size_t n)
+	{
+		__TRACE_DEBUG("一级空间配置器申请%ubytes\n", n);
+		void* result = malloc(n);
+		if (result == NULL)
+		{
+			//当向系统申请内存失败后调用_handle函数
+			result = OOMMalloc(n);
+		}
+		return result;
+	}
+
+	//调一级空间配置器来释放内存
+	static void DeAllocate(void* p)
+	{
+		__TRACE_DEBUG("一级空间配置器释放空间\n");
+		free(p);
+	}
+
+	HANDLEFUNC SetMallocHandler(HANDLEFUNC f)
+	{
+		HANDLEFUNC old = _handle;
+		_handle = f;
+		return old;
+	}
+
+private:
+	//内存不足时的处理函数（1.抛异常 2、向系统申请到了）
+	static void* OOMMalloc(size_t n)
+	{
+		while (1)
+		{
+			if (_handle == NULL)//1.如果没有设置该句柄函数，则抛异常
+			{
+				throw bad_alloc();
+			}
+			_handle();//企图释放空间
+			void* result = malloc(n);
+			if (result)
+			{
+				return result;
+			}
+		}
+	}
+	static HANDLEFUNC _handle;
+};
+
+template<>
+HANDLEFUNC typename AllocMallocTemplate<0>::_handle = 0;//初始化函数指针为0，
+
+///////////////////////////////////
+///////////二级空间配置器/////////
+//狭义内存池（两个指针）+自由链表（指针数组）
+
+
+template<bool threads, int inst>
+class DefaultAllocTemplate
+{
+	union Obj {
+		union Obj * free_list_link;//指向下一块同样大小的内存块
+		char client_data[1]; //为了调试
+	};
+
+public:
+	enum { ALIGN = 8 };//从自由链表中可申请的最小的内存块
+	enum { MAXBYTES = 128 };//从自由链表中可申请的最大内存块
+	enum { NFREELISTS = MAXBYTES / ALIGN };//自由链表的长度
+
+	static void* Allocate(size_t bytes);
+	static void DeAllocate(void* p, size_t n);
+
+private:
+
+	//获取一块内存在自由链表中的下标
+	static size_t _FreeListIndex(size_t bytes)
+	{
+		return (bytes + ALIGN - 1) / (ALIGN - 1);
+	}
+
+	//将所需的内存向上调整至8的倍数
+	static size_t _RoundUp(size_t bytes)
+	{
+		return (bytes + ALIGN - 1)&(~(ALIGN - 1));
+	}
+	static void* _Refill(size_t n);//向狭义内存池申请内存，填充自由链表
+	static char* _ChunkAlloc(size_t bytes, int& nobjs);//向内存池申请nobjs块bytes字节的内存
+
+private:
+	//狭义内存池的标记
+	static char* _startFree;
+	static char* _endFree;
+	static size_t _heapSize;//保存当前已经向系统申请了多少内存
+	static Obj* FreeList[NFREELISTS];//自由链表
+};
+
+//初始化狭义内存池和自由链表
+template<>
+typename char* DefaultAllocTemplate<false, 0>::_startFree = 0;
+
+
+template<>
+typename char* DefaultAllocTemplate<false, 0>::_endFree = 0;
+
+template<>
+typename size_t DefaultAllocTemplate<false, 0>::_heapSize = 0;
+
+template<>
+typename DefaultAllocTemplate<false,0>::Obj* DefaultAllocTemplate<false, 0>::FreeList[NFREELISTS] = { 0 };
+
+
+
+//2.refill内部调用函数-->真正向内存池申请空间
+template<>
+char* DefaultAllocTemplate<false, 0>::_ChunkAlloc(size_t n, int& nobjs)
+{
+	char* result = 0;
+	size_t totalBytes = n * nobjs;//需要申请的总大小
+	size_t leftBytes = _endFree - _startFree;//内存池剩余的大小
+	if (leftBytes >= totalBytes)//当内存池中的内存足够时，直接返回
+	{
+		__TRACE_DEBUG("狭义内存池中有足够%u个对象\n", nobjs);
+		result = _startFree;
+		_startFree += totalBytes;
+		return result;
+	}
+	else if (leftBytes >= n)//当内存池中的内存不能满足需求量，但足够供应一块区块
+	{
+		nobjs = leftBytes / n;//更新可以分配的内存块
+		__TRACE_DEBUG("狭义内存池中只有%u个对象\n", nobjs);
+		result = _startFree;
+		_startFree += leftBytes;
+		return result;
+	}
+	else//当内存池的剩余空间连一个区块都无法供应
+	{
+		//这时内存池需要向系统申请空间,向系统申请就需要多申请：申请20区块的2倍的空间
+		int newBytes = 2 * totalBytes + _RoundUp(_heapSize>>4);
+		//在向系统申请之前，需要将内存池中剩余的内存全部挂到自由链表中
+		if (leftBytes > 0)
+		{
+			Obj** myFreelist = FreeList + _FreeListIndex(leftBytes);
+			((Obj*)_startFree)->free_list_link = *myFreelist;
+			*myFreelist = (Obj*)_startFree;
+		}
+		__TRACE_DEBUG("一个对象都没有，到系统申请%ubytes\n", newBytes);
+		_startFree = (char*)malloc(newBytes);
+		if (_startFree == NULL)//如果系统内存不足，则在自由链表的更大的位置寻找我们还可以使用的
+		{
+			int i = _FreeListIndex(n);
+			for (; i < NFREELISTS; ++i)
+			{
+				Obj** myFreelist = FreeList + i;
+				Obj* res = *myFreelist;
+				if (res != NULL)//在自由链表中找到内存时
+				{
+					*myFreelist = res->free_list_link;
+					_startFree = (char*)res;
+					_endFree = _startFree + (i + 1)*ALIGN;
+					return _ChunkAlloc(n, nobjs);
+				}
+			}
+			_endFree = 0;//山穷水尽的地步，说明自由链表已经没有合适的内存了
+			//这时可以调用一级空间配置器-->handler机制试图释放空间
+			_startFree = (char*)AllocMallocTemplate<0>::Allocate(newBytes);
+		}
+		//申请成功了，更新heapsize（记录共向系统申请了多少内存空间）
+		_heapSize += newBytes;
+		_endFree = _startFree + newBytes;
+		 return _ChunkAlloc(n, nobjs);
+	}
+}
+
+
+//1.向内存池申请内存-->填充自由链表（注意：n已经是8的倍数）
+template<>
+void* DefaultAllocTemplate<false, 0>::_Refill(size_t n)
+{
+	int nobjs = 20;
+	char* chunk = _ChunkAlloc(n, nobjs);//默认申请20块所需的内存块
+	__TRACE_DEBUG("到狭义内存池取到了%u个%ubytes的对象\n", nobjs,n);
+
+
+	__TRACE_DEBUG("返回一个对象，将剩余的%u个对象挂到自由链表的下面\n", nobjs - 1);
+	if (nobjs == 1)
+	{
+		return chunk;
+	}
+	Obj* ret = (Obj*)chunk;
+	Obj** myFreelist = FreeList + _FreeListIndex(n);
+	*myFreelist = (Obj*)(chunk + n);//先将第一块插入自由链表
+	Obj* cur = *myFreelist;
+	Obj* next = 0;
+	for (int i = 2; i < nobjs; ++i)//将剩余的nobjs - 2块链到自由链表中
+	{
+		next = (Obj*)(chunk + i*n);
+		cur->free_list_link = next;
+		cur = next;
+	}
+	return ret;
+}
+
+
+//实现分配内存空间的函数
+template<>
+void* DefaultAllocTemplate<false, 0>::Allocate(size_t bytes)
+{
+	__TRACE_DEBUG("调用二级空间配置器申请%u bytes\n", bytes);
+	void* ret = NULL;
+	//1.判断bytes是否大于128,-->是--》调用一级空间配置器
+	if (bytes > MAXBYTES)
+	{
+		ret = AllocMallocTemplate<0>::Allocate(bytes);
+	}
+	else//2.bytes小于128---》去自由链表中查找
+	{
+		int index = _FreeListIndex(bytes);
+		Obj** myFreelist = FreeList + index;
+		Obj* result = *myFreelist;
+		if (result == NULL)
+		{
+			__TRACE_DEBUG("在freelist的[%u]下没有挂内存块对象\n", index);
+			ret = _Refill(_RoundUp(bytes));//如果自由链表中所需的内存块为空，则向内存池申请--》用来填充内存
+		}
+		else//如果自由链表中有所需的内存块，则直接头摘，将其返回。
+		{
+			__TRACE_DEBUG("在freelist的[%u]取一个内存块对象\n", index);
+			(*myFreelist) = result->free_list_link;
+			ret = (void*)result;
+		}
+	}
+	return ret;
+}
+
+
+//二级空间配置器释放空间--->实质上就是还给自由链表，并没有真正还给操作系统.
+template<>
+void DefaultAllocTemplate<false, 0>::DeAllocate(void* p, size_t n)
+{
+	if (n > MAXBYTES)
+	{
+		AllocMallocTemplate<0>::DeAllocate(p);
+		return;
+	}
+	
+		//头插进自由链表中
+		Obj* tmp = (Obj*)p;
+		int index = _FreeListIndex(n);
+		__TRACE_DEBUG("将释放的内存块挂到freelist[%u]\n", index);
+		Obj** myFreelist = FreeList +index;
+		tmp->free_list_link = *myFreelist;
+		*myFreelist = tmp;
+	
+}
+
